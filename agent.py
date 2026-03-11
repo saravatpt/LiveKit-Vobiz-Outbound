@@ -6,9 +6,7 @@ from dotenv import load_dotenv
 from livekit import agents, api
 from livekit.agents import AgentSession, Agent, RoomInputOptions
 from livekit.plugins import (
-    openai,
-    cartesia,
-    deepgram,
+    google,
     noise_cancellation,
     silero,
 )
@@ -30,76 +28,52 @@ SIP_DOMAIN = os.getenv("VOBIZ_SIP_DOMAIN")
 
 
 def _build_tts():
-    """Configure the Text-to-Speech provider based on env vars."""
-    provider = os.getenv("TTS_PROVIDER", "openai").lower()
-    
-    if provider == "cartesia":
-        logger.info("Using Cartesia TTS")
-        model = os.getenv("CARTESIA_TTS_MODEL", "sonic-2")
-        voice = os.getenv("CARTESIA_TTS_VOICE", "f786b574-daa5-4673-aa0c-cbe3e8534c02")
-        return cartesia.TTS(model=model, voice=voice)
-    
-    # Default to OpenAI
-    logger.info("Using OpenAI TTS")
-    model = os.getenv("OPENAI_TTS_MODEL", "tts-1")
-    voice = os.getenv("OPENAI_TTS_VOICE", "alloy")
-    return openai.TTS(model=model, voice=voice)
+    """Configure the Text-to-Speech provider."""
+    logger.info("Using Google TTS")
+    return google.TTS(
+        credentials_file=os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+    )
 
 
 
-class TransferFunctions(llm.ToolContext):
-    def __init__(self, ctx: agents.JobContext, phone_number: str = None):
-        super().__init__(tools=[])
-        self.ctx = ctx
-        self.phone_number = phone_number
+def build_transfer_tool(ctx: agents.JobContext, phone_number: str = None):
+    """Build a transfer_call function tool with the job context captured via closure."""
 
     @llm.function_tool(description="Transfer the call to a human support agent or another phone number.")
-    async def transfer_call(self, destination: Optional[str] = None):
-        """
-        Transfer the call.
-        """
+    async def transfer_call(destination: Optional[str] = None):
         if destination is None:
             destination = os.getenv("DEFAULT_TRANSFER_NUMBER")
             if not destination:
-                 return "Error: No default transfer number configured."
+                return "Error: No default transfer number configured."
         if "@" not in destination:
-            # If no domain is provided, append the SIP domain
             if SIP_DOMAIN:
-                # Ensure clean number (strip tel: or sip: prefix if present but no domain)
                 clean_dest = destination.replace("tel:", "").replace("sip:", "")
                 destination = f"sip:{clean_dest}@{SIP_DOMAIN}"
             else:
-                # Fallback to tel URI if no domain configured
                 if not destination.startswith("tel:") and not destination.startswith("sip:"):
-                     destination = f"tel:{destination}"
+                    destination = f"tel:{destination}"
         elif not destination.startswith("sip:"):
-             destination = f"sip:{destination}"
-        
+            destination = f"sip:{destination}"
+
         logger.info(f"Transferring call to {destination}")
-        
-        # Determine the participant identity
-        # For outbound calls initiated by this agent, the participant identity is typically "sip_<phone_number>"
-        # For inbound, we might need to find the remote participant.
+
         participant_identity = None
-        
-        # If we stored the phone number from metadata, we can construct the identity
-        if self.phone_number:
-            participant_identity = f"sip_{self.phone_number}"
+        if phone_number:
+            participant_identity = f"sip_{phone_number}"
         else:
-            # Try to find a participant that is NOT the agent
-            for p in self.ctx.room.remote_participants.values():
+            for p in ctx.room.remote_participants.values():
                 participant_identity = p.identity
                 break
-        
+
         if not participant_identity:
             logger.error("Could not determine participant identity for transfer")
             return "Failed to transfer: could not identify the caller."
 
         try:
             logger.info(f"Transferring participant {participant_identity} to {destination}")
-            await self.ctx.api.sip.transfer_sip_participant(
+            await ctx.api.sip.transfer_sip_participant(
                 api.TransferSIPParticipantRequest(
-                    room_name=self.ctx.room.name,
+                    room_name=ctx.room.name,
                     participant_identity=participant_identity,
                     transfer_to=destination,
                     play_dialtone=False
@@ -109,6 +83,8 @@ class TransferFunctions(llm.ToolContext):
         except Exception as e:
             logger.error(f"Transfer failed: {e}")
             return f"Error executing transfer: {e}"
+
+    return transfer_call
 
 
 class OutboundAssistant(Agent):
@@ -153,16 +129,18 @@ async def entrypoint(ctx: agents.JobContext):
     except Exception:
         logger.warning("No valid JSON metadata found. This might be an inbound call.")
 
-    # Initialize function context
-    fnc_ctx = TransferFunctions(ctx, phone_number)
+    # Build transfer tool
+    transfer_tool = build_transfer_tool(ctx, phone_number)
 
     # Initialize the Agent Session with plugins
-
     session = AgentSession(
-        stt=deepgram.STT(model="nova-3", language="multi"),
-        llm=openai.LLM(model="gpt-4o-mini"),
+        stt=google.STT(
+            credentials_file=os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+        ),
+        llm=google.LLM(model="gemini-2.5-flash"),
         tts=_build_tts(),
-        tools=fnc_ctx.all_tools,
+        vad=silero.VAD.load(),
+        tools=[transfer_tool],
     )
 
     # Start the session
